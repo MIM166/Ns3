@@ -30,6 +30,7 @@
 #include "ns3/trace-source-accessor.h"
 #include "ns3/traffic-control-layer.h"
 #include "ns3/uinteger.h"
+#include "ns3/bolt-header.h"
 
 namespace ns3
 {
@@ -559,14 +560,12 @@ Ipv4L3Protocol::Receive(Ptr<NetDevice> device,
                         NetDevice::PacketType packetType)
 {
     NS_LOG_FUNCTION(this << device << p << protocol << from << to << packetType);
-
     NS_LOG_LOGIC("Packet from " << from << " received on node " << m_node->GetId());
 
     int32_t interface = GetInterfaceForDevice(device);
     NS_ASSERT_MSG(interface != -1, "Received a packet from an interface that is not known to IPv4");
 
     Ptr<Packet> packet = p->Copy();
-
     Ptr<Ipv4Interface> ipv4Interface = m_interfaces[interface];
 
     if (ipv4Interface->IsUp())
@@ -601,6 +600,64 @@ Ipv4L3Protocol::Receive(Ptr<NetDevice> device,
         m_dropTrace(ipHeader, packet, DROP_BAD_CHECKSUM, this, interface);
         return;
     }
+
+    // ================================================================
+    // BOLT INTEGRATION: Detect and route SRC packets back to sender
+    // ================================================================
+    if (ipHeader.GetProtocol() == 6) // TCP protocol number
+    {
+        // Check if this is a Bolt SRC packet
+        BoltHeader boltHdr;
+        if (packet->GetSize() >= boltHdr.GetSerializedSize())
+        {
+            Ptr<Packet> copy = packet->Copy();
+            uint32_t boltHeaderSize = copy->PeekHeader(boltHdr);
+
+            if (boltHeaderSize > 0 && (boltHdr.GetFlags() & BoltHeader::BTS))
+            {
+                NS_LOG_INFO("Detected Bolt SRC packet at IP layer - routing back to sender");
+
+                // This is an SRC packet - swap IP addresses and send back
+                Ipv4Address originalSource = ipHeader.GetSource();
+                Ipv4Address originalDestination = ipHeader.GetDestination();
+
+                // Create new IP header with swapped addresses
+                Ipv4Header newIpHeader = ipHeader;
+                newIpHeader.SetSource(originalDestination);
+                newIpHeader.SetDestination(originalSource);
+                newIpHeader.SetTtl(64); // Reset TTL
+
+                // Recalculate checksum
+                if (Node::ChecksumEnabled())
+                {
+                    newIpHeader.EnableChecksum();
+                }
+
+                // Add IP header back to packet
+                packet->AddHeader(newIpHeader);
+
+                // Route the SRC packet back
+                Ptr<Ipv4Route> route = Create<Ipv4Route>();
+                route->SetDestination(originalSource);
+                route->SetSource(originalDestination);
+                route->SetGateway(originalSource);
+                route->SetOutputDevice(device);
+
+                NS_LOG_LOGIC("Routing SRC packet: "
+                             << originalDestination << " -> " << originalSource
+                             << " via device " << device->GetIfIndex());
+
+                // Send the packet back out
+                SendRealOut(route, packet, ipHeader);
+
+                // Don't process as normal packet
+                return;
+            }
+        }
+    }
+    // ================================================================
+    // END BOLT INTEGRATION
+    // ================================================================
 
     // the packet is valid, we update the ARP cache entry (if present)
     Ptr<ArpCache> arpCache = ipv4Interface->GetArpCache();
@@ -652,7 +709,6 @@ Ipv4L3Protocol::Receive(Ptr<NetDevice> device,
         m_dropTrace(ipHeader, packet, DROP_NO_ROUTE, this, interface);
     }
 }
-
 Ptr<Icmpv4L4Protocol>
 Ipv4L3Protocol::GetIcmp() const
 {

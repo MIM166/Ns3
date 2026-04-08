@@ -50,8 +50,11 @@
 #include "ns3/simulator.h"
 #include "ns3/trace-source-accessor.h"
 #include "ns3/uinteger.h"
+#include "bolt-header.h"
+#include "tcp-bolt.h"
 
 #include <algorithm>
+#include <limits>
 #include <math.h>
 
 namespace
@@ -81,6 +84,44 @@ const std::map<std::pair<ns3::TcpSocketBase::TcpPacketType_t, ns3::TcpSocketStat
         {{ns3::TcpSocketBase::RE_XMT, ns3::TcpSocketState::DctcpEcn}, true},
         {{ns3::TcpSocketBase::DATA, ns3::TcpSocketState::DctcpEcn}, true},
     };
+
+bool
+TryRemoveBoltHeaderFromPayload(ns3::Ptr<ns3::Packet> packet,
+                               const ns3::TcpHeader& tcpHeader,
+                               ns3::BoltHeader* boltOut)
+{
+    ns3::BoltHeader boltHdr;
+    if (packet->GetSize() < boltHdr.GetSerializedSize())
+    {
+        return false;
+    }
+
+    ns3::Ptr<ns3::Packet> copy = packet->Copy();
+    if (copy->PeekHeader(boltHdr) == 0)
+    {
+        return false;
+    }
+
+    const bool portMatch = (boltHdr.GetSrcPort() == tcpHeader.GetSourcePort()) &&
+                           (boltHdr.GetDstPort() == tcpHeader.GetDestinationPort());
+    const bool hasRoleFlag = (boltHdr.GetFlags() & (ns3::BoltHeader::DATA | ns3::BoltHeader::ACK |
+                                                     ns3::BoltHeader::BTS)) != 0;
+    if (!portMatch || !hasRoleFlag)
+    {
+        return false;
+    }
+
+    if (packet->RemoveHeader(boltHdr) == 0)
+    {
+        return false;
+    }
+
+    if (boltOut)
+    {
+        *boltOut = boltHdr;
+    }
+    return true;
+}
 } // namespace
 
 namespace ns3
@@ -382,6 +423,8 @@ TcpSocketBase::TcpSocketBase(const TcpSocketBase& sock)
       m_shutdownRecv(sock.m_shutdownRecv),
       m_connected(sock.m_connected),
       m_msl(sock.m_msl),
+      m_boltFinalTailSequence(sock.m_boltFinalTailSequence),
+      m_hasBoltFinalTailSequence(sock.m_hasBoltFinalTailSequence),
       m_maxWinSize(sock.m_maxWinSize),
       m_bytesAckedNotProcessed(sock.m_bytesAckedNotProcessed),
       m_rWnd(sock.m_rWnd),
@@ -819,6 +862,7 @@ TcpSocketBase::Close()
     { // App close with pending data must wait until all data transmitted
         if (!m_closeOnEmpty)
         {
+            PrepareBoltFlowClosure();
             m_closeOnEmpty = true;
             NS_LOG_INFO("Socket " << this << " deferring close, state " << TcpStateName[m_state]);
         }
@@ -834,6 +878,7 @@ TcpSocketBase::ShutdownSend()
     NS_LOG_FUNCTION(this);
 
     // this prevents data from being added to the buffer
+    PrepareBoltFlowClosure();
     m_shutdownSend = true;
     m_closeOnEmpty = true;
     // if buffer is already empty, send a fin now
@@ -859,6 +904,41 @@ TcpSocketBase::ShutdownSend()
     }
 
     return 0;
+}
+
+void
+TcpSocketBase::PrepareBoltFlowClosure()
+{
+    NS_LOG_FUNCTION(this);
+
+    Ptr<TcpBolt> boltCC = DynamicCast<TcpBolt>(m_congestionControl);
+    if (boltCC == nullptr)
+    {
+        return;
+    }
+
+    m_boltFinalTailSequence = m_txBuffer->TailSequence();
+    m_hasBoltFinalTailSequence = true;
+    NS_LOG_LOGIC("Recorded Bolt final tail sequence " << m_boltFinalTailSequence);
+}
+
+void
+TcpSocketBase::SetBoltExpectedFlowBytes(uint64_t totalBytes)
+{
+    NS_LOG_FUNCTION(this << totalBytes);
+
+    Ptr<TcpBolt> boltCC = DynamicCast<TcpBolt>(m_congestionControl);
+    if (boltCC == nullptr || totalBytes == 0)
+    {
+        return;
+    }
+
+    NS_ABORT_MSG_IF(totalBytes > std::numeric_limits<uint32_t>::max(),
+                    "Bolt expected flow bytes exceed SequenceNumber32 range");
+
+    m_boltFinalTailSequence = m_txBuffer->HeadSequence() + SequenceNumber32(totalBytes);
+    m_hasBoltFinalTailSequence = true;
+    NS_LOG_LOGIC("Recorded Bolt expected final tail sequence " << m_boltFinalTailSequence);
 }
 
 /* Inherit from Socket class: Signal a termination of receive */
@@ -1529,6 +1609,24 @@ TcpSocketBase::ProcessEstablished(Ptr<Packet> packet, const TcpHeader& tcpHeader
     uint8_t tcpflags =
         tcpHeader.GetFlags() & ~(TcpHeader::PSH | TcpHeader::URG | TcpHeader::CWR | TcpHeader::ECE);
 
+    // BOLT control headers are carried in TCP payload in this model.
+    // Strip them before normal TCP processing so ACK/data accounting stays consistent.
+    m_currentSegmentHasBoltHeader = false;
+    m_currentSegmentAckHasInc = false;
+    Ptr<TcpBolt> boltCC = DynamicCast<TcpBolt>(m_congestionControl);
+    if (boltCC != nullptr)
+    {
+        BoltHeader boltHdr;
+        if (TryRemoveBoltHeaderFromPayload(packet, tcpHeader, &boltHdr))
+        {
+            m_currentSegmentHasBoltHeader = true;
+            m_currentSegmentBoltHeader = boltHdr;
+            m_currentSegmentAckHasInc =
+                ((boltHdr.GetFlags() & BoltHeader::ACK) != 0) &&
+                ((boltHdr.GetFlags() & BoltHeader::INCWIN) != 0);
+        }
+    }
+
     // Different flags are different events
     if (tcpflags == TcpHeader::ACK)
     {
@@ -1601,6 +1699,9 @@ TcpSocketBase::ProcessEstablished(Ptr<Packet> packet, const TcpHeader& tcpHeader
         }
         CloseAndNotify();
     }
+
+    m_currentSegmentHasBoltHeader = false;
+    m_currentSegmentAckHasInc = false;
 }
 
 bool
@@ -1958,6 +2059,20 @@ TcpSocketBase::ReceivedAck(Ptr<Packet> packet, const TcpHeader& tcpHeader)
     // RFC 6675, Section 5, point (C), try to send more data. NB: (C) is implemented
     // inside SendPendingData
     SendPendingData(m_connected);
+
+    // BOLT INTEGRATION: Process INC flag reflected in ACK control header.
+    if (m_currentSegmentAckHasInc)
+    {
+        NS_LOG_INFO("Received ACK with INC flag");
+
+        Ptr<TcpBolt> boltCC = DynamicCast<TcpBolt>(m_congestionControl);
+        if (boltCC != nullptr)
+        {
+            boltCC->ProcessIncFlag(true, m_tcb);
+            NS_LOG_INFO("Processed INC flag: cwnd=" << m_tcb->m_cWnd);
+        }
+    }
+
 }
 
 void
@@ -2783,6 +2898,41 @@ TcpSocketBase::SendEmptyPacket(uint8_t flags)
     }
 
     Ptr<Packet> p = Create<Packet>();
+    // ================================================================
+    // BOLT INTEGRATION: Add BoltHeader to ACK packets
+    // ================================================================
+    if (flags & TcpHeader::ACK)
+    {
+        Ptr<TcpBolt> boltCC = DynamicCast<TcpBolt>(m_congestionControl);
+        if (boltCC != nullptr)
+        {
+            // Reflect INC flag from received data packet
+            if (m_lastReceivedBoltHeader.GetFlags() & BoltHeader::INCWIN)
+            {
+                BoltHeader ackBoltHdr;
+                ackBoltHdr.SetFlags(BoltHeader::ACK | BoltHeader::INCWIN);
+                
+                if (m_endPoint != nullptr)
+                {
+                    ackBoltHdr.SetSrcPort(m_endPoint->GetLocalPort());
+                    ackBoltHdr.SetDstPort(m_endPoint->GetPeerPort());
+                }
+                else
+                {
+                    ackBoltHdr.SetSrcPort(m_endPoint6->GetLocalPort());
+                    ackBoltHdr.SetDstPort(m_endPoint6->GetPeerPort());
+                }
+                
+                p->AddHeader(ackBoltHdr);
+                
+                NS_LOG_INFO("Added BoltHeader to ACK: flags=" 
+                            << BoltHeader::FlagsToString(ackBoltHdr.GetFlags()));
+            }
+        }
+    }
+    // ================================================================
+    // END BOLT INTEGRATION
+    // ================================================================
     TcpHeader header;
     SequenceNumber32 s = m_tcb->m_nextTxSequence;
     TcpPacketType_t packetType = INVALID;
@@ -3195,6 +3345,72 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
     uint8_t flags = withAck ? TcpHeader::ACK : 0;
     uint32_t remainingData = m_txBuffer->SizeFromSequence(seq + SequenceNumber32(sz));
 
+    // ================================================================
+    // BOLT INTEGRATION: Add BoltHeader to outgoing DATA packets
+    // ================================================================
+    Ptr<TcpBolt> boltCC = DynamicCast<TcpBolt>(m_congestionControl);
+    if (boltCC != nullptr && !isRetransmission)
+    {
+        BoltHeader boltHdr;
+        
+        // Set DATA flag
+        boltHdr.SetFlags(BoltHeader::DATA);
+        
+        // Set ports
+        if (m_endPoint)
+        {
+            boltHdr.SetSrcPort(m_endPoint->GetLocalPort());
+            boltHdr.SetDstPort(m_endPoint->GetPeerPort());
+        }
+        else
+        {
+            boltHdr.SetSrcPort(m_endPoint6->GetLocalPort());
+            boltHdr.SetDstPort(m_endPoint6->GetPeerPort());
+        }
+        
+        // Set sequence number
+        boltHdr.SetSeqAckNo(seq.GetValue());
+        
+        // Set TX timestamp for RTT calculation (nanoseconds).
+        // Keep units consistent with ProcessExternalSrcPacket().
+        boltHdr.SetReflectedDelay(Simulator::Now().GetNanoSeconds());
+        
+        // Set FIRST flag (first packet of connection or after idle)
+        if (m_txBuffer->HeadSequence() == seq)
+        {
+            boltHdr.SetFlags(boltHdr.GetFlags() | BoltHeader::FIRST);
+            NS_LOG_LOGIC("FIRST flag set");
+        }
+        
+        // LAST marks packets in the final window of a closing flow so the
+        // queue can mint PRU tokens roughly one RTT before completion.
+        SequenceNumber32 packetEnd = seq + SequenceNumber32(sz);
+        if (m_hasBoltFinalTailSequence && packetEnd <= m_boltFinalTailSequence)
+        {
+            uint32_t remainingToFlowTail = m_boltFinalTailSequence - packetEnd;
+            if (remainingToFlowTail <= m_tcb->m_cWnd.Get())
+            {
+                boltHdr.SetFlags(boltHdr.GetFlags() | BoltHeader::LAST);
+                NS_LOG_LOGIC("LAST flag set");
+            }
+        }
+        
+        if (boltCC->ShouldRequestInc(seq, sz, m_tcb))
+        {
+            boltHdr.SetFlags(boltHdr.GetFlags() | BoltHeader::INCWIN);
+        }
+        
+        // Add BoltHeader to packet
+        p->AddHeader(boltHdr);
+        uint32_t wireSize = p->GetSize();
+
+        NS_LOG_INFO("Added BoltHeader: flags=" << BoltHeader::FlagsToString(boltHdr.GetFlags())
+                    << " seq=" << seq << " payload=" << sz << " wire=" << wireSize);
+    }
+    // ================================================================
+    // END BOLT INTEGRATION
+    // ================================================================
+
     // TCP sender should not send data out of the window advertised by the
     // peer when it is not retransmission.
     NS_ASSERT(isRetransmission ||
@@ -3351,7 +3567,6 @@ TcpSocketBase::SendDataPacket(SequenceNumber32 seq, uint32_t maxSize, bool withA
     m_tcb->m_highTxMark = std::max(seq + sz, m_tcb->m_highTxMark.Get());
     return sz;
 }
-
 void
 TcpSocketBase::UpdateRttHistory(const SequenceNumber32& seq, uint32_t sz, bool isRetransmission)
 {
@@ -3616,7 +3831,58 @@ TcpSocketBase::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader)
 {
     NS_LOG_FUNCTION(this << tcpHeader);
     NS_LOG_DEBUG("Data segment, seq=" << tcpHeader.GetSequenceNumber()
-                                      << " pkt size=" << p->GetSize());
+                                       << " pkt size=" << p->GetSize());
+
+    // BOLT INTEGRATION: process per-segment control header parsed in ProcessEstablished().
+    if (m_currentSegmentHasBoltHeader)
+    {
+        const BoltHeader& boltHdr = m_currentSegmentBoltHeader;
+        if (boltHdr.GetFlags() & BoltHeader::BTS)
+        {
+            NS_LOG_INFO("Received SRC packet (Back To Sender)");
+
+            Ptr<TcpBolt> boltCC = DynamicCast<TcpBolt>(m_congestionControl);
+            if (boltCC != nullptr)
+            {
+                uint32_t drainTime = boltHdr.GetDrainTime();
+
+                DataRate linkRate("100Gbps");
+                if (boltHdr.GetFlags() & BoltHeader::LINK400G)
+                {
+                    linkRate = DataRate("400Gbps");
+                }
+                else if (boltHdr.GetFlags() & BoltHeader::LINK100G)
+                {
+                    linkRate = DataRate("100Gbps");
+                }
+                else if (boltHdr.GetFlags() & BoltHeader::LINK40G)
+                {
+                    linkRate = DataRate("40Gbps");
+                }
+                else if (boltHdr.GetFlags() & BoltHeader::LINK25G)
+                {
+                    linkRate = DataRate("25Gbps");
+                }
+                else if (boltHdr.GetFlags() & BoltHeader::LINK10G)
+                {
+                    linkRate = DataRate("10Gbps");
+                }
+
+                Time txTime = NanoSeconds(boltHdr.GetReflectedDelay());
+                boltCC->ProcessSrcPacket(drainTime, linkRate, txTime, m_tcb);
+
+                NS_LOG_INFO("Processed SRC: drainTime=" << drainTime << "ns, "
+                            << "linkRate=" << linkRate << ", "
+                            << "cwnd=" << m_tcb->m_cWnd);
+            }
+
+            return;
+        }
+
+        m_lastReceivedBoltHeader = boltHdr;
+        NS_LOG_LOGIC("Stored BoltHeader for ACK reflection: flags="
+                     << BoltHeader::FlagsToString(boltHdr.GetFlags()));
+    }
 
     // Put into Rx buffer
     SequenceNumber32 expectedSeq = m_tcb->m_rxBuffer->NextRxSequence();
@@ -3708,7 +3974,6 @@ TcpSocketBase::ReceivedData(Ptr<Packet> p, const TcpHeader& tcpHeader)
         }
     }
 }
-
 Time
 TcpSocketBase::CalculateRttSample(const TcpHeader& tcpHeader, const RttHistory& rttHistory)
 {
@@ -4577,6 +4842,61 @@ TcpSocketBase::GetRxBuffer() const
     return m_tcb->m_rxBuffer;
 }
 
+Ptr<TcpCongestionOps>
+TcpSocketBase::GetCongestionControlAlgorithm() const
+{
+    return m_congestionControl;
+}
+
+void
+TcpSocketBase::ProcessExternalSrcPacket(Ptr<Packet> srcPacket)
+{
+    BoltHeader boltHdr;
+    Ptr<Packet> copy = srcPacket->Copy();
+    uint32_t sz = copy->PeekHeader(boltHdr);
+
+    if (sz == 0 || !(boltHdr.GetFlags() & BoltHeader::BTS))
+        return;
+
+    // ── Decode link rate from SRC flags ──────────────────────────────────
+    DataRate linkRate("10Gbps"); // conservative default
+    if      (boltHdr.GetFlags() & BoltHeader::LINK400G) linkRate = DataRate("400Gbps");
+    else if (boltHdr.GetFlags() & BoltHeader::LINK100G) linkRate = DataRate("100Gbps");
+    else if (boltHdr.GetFlags() & BoltHeader::LINK40G)  linkRate = DataRate("40Gbps");
+    else if (boltHdr.GetFlags() & BoltHeader::LINK25G)  linkRate = DataRate("25Gbps");
+
+    ProcessExternalSrcPacket(srcPacket, linkRate);
+}
+
+void
+TcpSocketBase::ProcessExternalSrcPacket(Ptr<Packet> srcPacket, DataRate linkRate)
+{
+    // WIRELESS ADAPTATION:
+    // External adapters can inject Bolt SRC feedback while supplying the
+    // actual link rate directly.  This keeps the Bolt control law unchanged
+    // and avoids inventing new BoltHeader rate encodings for low-rate media.
+    Ptr<TcpBolt> boltCC = DynamicCast<TcpBolt>(m_congestionControl);
+    if (!boltCC)
+        return;
+
+    BoltHeader boltHdr;
+    Ptr<Packet> copy = srcPacket->Copy();
+    uint32_t sz = copy->PeekHeader(boltHdr);
+
+    if (sz == 0 || !(boltHdr.GetFlags() & BoltHeader::BTS))
+        return;
+
+    // The reflectedDelay field stores the TX timestamp in nanoseconds.
+    Time txTime = NanoSeconds(boltHdr.GetReflectedDelay());
+
+    // ── Algorithm 2 lines 1-8 ────────────────────────────────────────────
+    boltCC->ProcessSrcPacket(boltHdr.GetDrainTime(), linkRate, txTime, m_tcb);
+
+    NS_LOG_INFO("ProcessExternalSrcPacket: drainTime=" << boltHdr.GetDrainTime()
+                << "ns linkRate=" << linkRate
+                << " cwnd=" << m_tcb->m_cWnd);
+}
+
 void
 TcpSocketBase::SetRetxThresh(uint32_t retxThresh)
 {
@@ -4793,7 +5113,7 @@ TcpSocketBase::IsEct(TcpPacketType_t packetType) const
         return false;
     }
 
-    NS_ABORT_MSG_IF(!ECN_RESTRICTION_MAP.contains(std::make_pair(packetType, m_tcb->m_ecnMode)),
+    NS_ABORT_MSG_IF(ECN_RESTRICTION_MAP.contains(std::make_pair(packetType, m_tcb->m_ecnMode)),
                     "Invalid packetType and ecnMode");
 
     return ECN_RESTRICTION_MAP.at(std::make_pair(packetType, m_tcb->m_ecnMode));

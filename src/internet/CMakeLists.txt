@@ -126,6 +126,9 @@ set(source_files
     model/udp-socket-factory.cc
     model/udp-socket-impl.cc
     model/udp-socket.cc
+    model/bolt-header.cc
+    model/bolt-queue.cc
+    model/tcp-bolt.cc
 )
 
 set(header_files
@@ -249,6 +252,9 @@ set(header_files
     model/udp-socket-factory.h
     model/udp-socket.h
     model/windowed-filter.h
+    model/bolt-header.h
+    model/bolt-queue.h
+    model/tcp-bolt.h
 )
 
 set(private_header_files)

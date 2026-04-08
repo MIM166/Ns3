@@ -60,7 +60,7 @@ NS_LOG_COMPONENT_DEFINE("FifthScriptExample");
 static void
 CwndChange(uint32_t oldCwnd, uint32_t newCwnd)
 {
-    NS_LOG_UNCOND(Simulator::Now().GetSeconds() << "\t" << newCwnd);
+    NS_LOG_UNCOND(Simulator::Now().GetSeconds() << "\t" << "old congestion" <<newCwnd);
 }
 
 /**
